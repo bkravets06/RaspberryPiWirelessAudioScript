@@ -31,9 +31,11 @@ sudo reboot
 ## Requirements
 
 - Raspberry Pi (any model with WiFi/Bluetooth, or with USB adapters)
-- Raspberry Pi OS (Bullseye or newer recommended)
+- Raspberry Pi OS - **both Desktop and Lite versions are supported**
 - Speaker connected via 3.5mm jack, HDMI, or USB audio
 - Network connection (WiFi or Ethernet)
+
+> **Note:** The script auto-detects your username, so it works whether you use the default `pi` user or a custom username created during imaging.
 
 ## What Gets Installed
 
