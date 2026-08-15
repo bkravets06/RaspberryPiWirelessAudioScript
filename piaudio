@@ -1,0 +1,1385 @@
+#!/usr/bin/env bash
+#
+# piaudio - turn a Raspberry Pi into a wireless speaker for iPhone and Android.
+#
+#   AirPlay 2       shairport-sync + nqptp   iPhone, iPad, Mac
+#   Bluetooth A2DP  bluez + bluez-alsa       Android, iPhone, anything
+#   DLNA / UPnP     gmediarender             Android apps, Windows
+#   Spotify Connect librespot (opt-in)       Spotify on any platform
+#
+# Everything is routed straight to ALSA through a shared dmix device, so no
+# PulseAudio or PipeWire session is required. That is what makes this behave
+# identically on Raspberry Pi OS Lite and Desktop.
+#
+# Install: sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/bkravets06/RaspberryPiWirelessAudioScript/main/piaudio)"
+# Manage:  piaudio status | logs | rename | output | test | restart | uninstall
+#
+# MIT License.
+
+set -euo pipefail
+
+VERSION="2.0.0"
+RAW_URL="https://raw.githubusercontent.com/bkravets06/RaspberryPiWirelessAudioScript/main/piaudio"
+
+CONF=/etc/piaudio.conf
+LIBDIR=/usr/local/lib/piaudio
+BINPATH=/usr/local/bin/piaudio
+BACKUPDIR=/var/backups/piaudio
+ASOUND=/etc/asound.conf
+
+BUILD_TMP=""
+cleanup() { [ -n "$BUILD_TMP" ] && rm -rf "$BUILD_TMP"; return 0; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- output ----
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[36m'
+    DIM=$'\033[2m'; BOLD=$'\033[1m'; N=$'\033[0m'
+else
+    R=""; G=""; Y=""; B=""; DIM=""; BOLD=""; N=""
+fi
+
+STEP_NO=0
+STEP_TOTAL=10
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s\n' "  $*"; }
+ok()   { printf '  %s\xe2\x9c\x93%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*" >&2; }
+err()  { printf '  %s\xe2\x9c\x97%s %s\n' "$R" "$N" "$*" >&2; }
+die()  { printf '\n%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+step() {
+    STEP_NO=$((STEP_NO + 1))
+    printf '\n%s[%d/%d]%s %s%s%s\n' "$DIM" "$STEP_NO" "$STEP_TOTAL" "$N" "$BOLD" "$*" "$N"
+}
+
+banner() {
+    printf '%s' "$B"
+    cat <<'ART'
+        _      _   _   ___  ___ ___ ___
+   ___ (_)__ _| | | | |   \|_ _| _ \ __|
+  / _ \| / _` | |_| | | |) || ||   / _|
+ / .__/|_\__,_|\___/  |___/|___|_|_\___|
+/_/
+ART
+    printf '%s  wireless speaker for iPhone + Android  %sv%s%s\n' "$N" "$DIM" "$VERSION" "$N"
+}
+
+# ----------------------------------------------------------------- utils ----
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    die "this needs root. Run:
+
+    sudo bash -c \"\$(curl -fsSL $RAW_URL)\"
+
+  or, if you already have the file:
+
+    sudo ./piaudio $*"
+}
+
+# Prompts must never read plain stdin: under `curl ... | bash` stdin is the
+# script source itself, so a bare `read` would swallow the rest of the program.
+TTY=""
+init_tty() {
+    [ "$ASSUME_YES" = yes ] && return 0
+    if [ -e /dev/tty ] && (exec 3<>/dev/tty) 2>/dev/null; then
+        TTY=/dev/tty
+    else
+        warn "no terminal attached; using defaults for every question"
+        ASSUME_YES=yes
+    fi
+    return 0
+}
+
+interactive() { [ "$ASSUME_YES" != yes ] && [ -n "$TTY" ]; }
+
+# ask <prompt> <default>
+ask() {
+    local prompt=$1 default=$2 reply=""
+    if ! interactive; then printf '%s' "$default"; return 0; fi
+    printf '  %s%s%s [%s]: ' "$BOLD" "$prompt" "$N" "$default" >"$TTY"
+    IFS= read -r reply <"$TTY" || reply=""
+    printf '%s' "${reply:-$default}"
+}
+
+# confirm <prompt> <yes|no>
+confirm() {
+    local prompt=$1 default=$2 hint reply
+    [ "$default" = yes ] && hint="Y/n" || hint="y/N"
+    if ! interactive; then [ "$default" = yes ]; return; fi
+    printf '  %s%s%s [%s]: ' "$BOLD" "$prompt" "$N" "$hint" >"$TTY"
+    IFS= read -r reply <"$TTY" || reply=""
+    reply=${reply:-$default}
+    case "$reply" in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+backup_path() { printf '%s/%s' "$BACKUPDIR" "$(printf '%s' "${1#/}" | tr / _)"; }
+
+# Keep one pristine copy of anything we overwrite so uninstall can undo it.
+backup_once() {
+    local f=$1 dest
+    [ -e "$f" ] || return 0
+    dest=$(backup_path "$f")
+    mkdir -p "$BACKUPDIR"
+    [ -e "$dest" ] || cp -a "$f" "$dest"
+    return 0
+}
+
+restore_backup() {
+    local f=$1 dest
+    dest=$(backup_path "$f")
+    [ -e "$dest" ] || return 1
+    cp -a "$dest" "$f" && rm -f "$dest"
+}
+
+# ini_set <file> <section> <key> <value>
+# Sets key under [section], replacing a commented-out line if that is all
+# there is, and creating the section when it is missing.
+ini_set() {
+    local file=$1 section=$2 key=$3 value=$4 tmp
+    [ -f "$file" ] || return 0
+    tmp=$(mktemp)
+    awk -v section="$section" -v key="$key" -v value="$value" '
+    BEGIN { insec = 0; done = 0 }
+    {
+        if ($0 ~ /^[ \t]*\[.*\][ \t]*$/) {
+            name = $0
+            sub(/^[ \t]*\[/, "", name)
+            sub(/\][ \t]*$/, "", name)
+            if (insec && !done) { print key " = " value; done = 1 }
+            insec = (name == section)
+            print
+            next
+        }
+        if (insec && !done) {
+            probe = $0
+            sub(/^[ \t]*#?[ \t]*/, "", probe)
+            if (probe ~ ("^" key "[ \t]*=")) { print key " = " value; done = 1; next }
+        }
+        print
+    }
+    END {
+        if (!done) {
+            if (!insec) { print ""; print "[" section "]" }
+            print key " = " value
+        }
+    }' "$file" >"$tmp" && mv "$tmp" "$file"
+    chmod 0644 "$file"
+}
+
+# ---------------------------------------------------------------- config ----
+
+PIAUDIO_NAME=""
+PIAUDIO_DEVICE=""
+PIAUDIO_RATE="44100"
+PIAUDIO_AIRPLAY="2"
+PIAUDIO_BLUETOOTH="on"
+PIAUDIO_DLNA="on"
+PIAUDIO_SPOTIFY="off"
+PIAUDIO_DLNA_UUID=""
+
+load_conf() {
+    # shellcheck source=/dev/null
+    [ -f "$CONF" ] && . "$CONF"
+    return 0
+}
+
+save_conf() {
+    cat >"$CONF" <<EOF
+# Written by piaudio $VERSION. Edit and run 'piaudio restart', or re-run the
+# installer to change things properly.
+PIAUDIO_NAME="$PIAUDIO_NAME"
+PIAUDIO_DEVICE="$PIAUDIO_DEVICE"
+PIAUDIO_RATE="$PIAUDIO_RATE"
+PIAUDIO_AIRPLAY="$PIAUDIO_AIRPLAY"
+PIAUDIO_BLUETOOTH="$PIAUDIO_BLUETOOTH"
+PIAUDIO_DLNA="$PIAUDIO_DLNA"
+PIAUDIO_SPOTIFY="$PIAUDIO_SPOTIFY"
+PIAUDIO_DLNA_UUID="$PIAUDIO_DLNA_UUID"
+EOF
+    chmod 0644 "$CONF"
+}
+
+# ------------------------------------------------------------------- apt ----
+
+APT_UPDATED=no
+export DEBIAN_FRONTEND=noninteractive
+APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+apt_refresh() {
+    [ "$APT_UPDATED" = yes ] && return 0
+    if ! apt-get update -qq >/dev/null 2>&1; then
+        warn "apt-get update had problems; retrying once"
+        sleep 3
+        apt-get update -qq >/dev/null 2>&1 || warn "continuing with a stale package list"
+    fi
+    APT_UPDATED=yes
+    return 0
+}
+
+pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^install ok installed$'; }
+pkg_exists()    { apt-cache show "$1" >/dev/null 2>&1; }
+
+# Install packages; abort the whole run if any of them fail.
+apt_need() {
+    local p missing=()
+    apt_refresh
+    for p in "$@"; do pkg_installed "$p" || missing+=("$p"); done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    apt-get install "${APT_OPTS[@]}" "${missing[@]}" >/dev/null \
+        || die "failed to install: ${missing[*]}"
+}
+
+# Install packages one by one, skipping whatever is unavailable. Non-zero if
+# anything could not be installed.
+apt_want() {
+    local p rc=0
+    apt_refresh
+    for p in "$@"; do
+        pkg_installed "$p" && continue
+        if ! pkg_exists "$p"; then
+            warn "package '$p' is not in this Pi's apt sources; skipping"
+            rc=1; continue
+        fi
+        apt-get install "${APT_OPTS[@]}" "$p" >/dev/null 2>&1 || { warn "could not install '$p'"; rc=1; }
+    done
+    return $rc
+}
+
+# --------------------------------------------------------------- systemd ----
+
+unit_exists() { systemctl cat "$1" >/dev/null 2>&1; }
+
+enable_now() {
+    local unit=$1
+    systemctl enable "$unit" >/dev/null 2>&1 || warn "could not enable $unit"
+    systemctl restart "$unit" >/dev/null 2>&1 \
+        || warn "$unit did not start -- check: piaudio logs ${unit%.service}"
+    return 0
+}
+
+disable_now() { systemctl disable --now "$1" >/dev/null 2>&1 || true; }
+
+write_unit() { cat >"$1"; chmod 0644 "$1"; }
+
+# ------------------------------------------------------------------ alsa ----
+
+# Emit "device<TAB>description" for every ALSA playback device.
+#
+# aplay -l lines look like:
+#   card 0: Headphones [bcm2835 Headphones], device 0: bcm2835 Headphones [...]
+# The device number's field index shifts with the length of the card name, so
+# find the "device N:" token rather than counting columns. Written for mawk,
+# which is what Raspberry Pi OS ships, so no gawk-only features.
+list_outputs() {
+    have aplay || return 0
+    # `aplay -l` exits non-zero when there are no sound cards at all; with
+    # pipefail that would otherwise abort the caller.
+    aplay -l 2>/dev/null | awk '
+        /^card [0-9]+:/ {
+            cardid = $3
+            devno = ""
+            for (i = 1; i < NF; i++) {
+                if ($i == "device" && $(i + 1) ~ /^[0-9]+:$/) {
+                    devno = $(i + 1); sub(":", "", devno); break
+                }
+            }
+            if (devno == "") next
+            lb = index($0, "["); rb = index($0, "]")
+            name = (lb > 0 && rb > lb) ? substr($0, lb + 1, rb - lb - 1) : cardid
+            desc = name
+            if (devno != "0") desc = desc " (device " devno ")"
+            printf "hw:CARD=%s,DEV=%s\t%s\n", cardid, devno, desc
+        }' || true
+}
+
+# `hostname -I` is Linux-only and absent from busybox; never let it abort a run.
+local_ip() { hostname -I 2>/dev/null | awk '{print $1}' || true; }
+
+describe_device() {
+    list_outputs | awk -F'\t' -v d="$1" '$1 == d { print $2; exit }'
+}
+
+# Rank candidates: an external DAC beats the headphone jack, which beats HDMI.
+# Match on the description as well as the device id -- older Pi OS releases
+# call the HDMI card "b1", which says nothing about it being HDMI.
+autodetect_output() {
+    local dev desc best="" best_rank=99 rank
+    while IFS=$'\t' read -r dev desc; do
+        [ -n "$dev" ] || continue
+        case "$dev $desc" in
+            *vc4hdmi*|*HDMI*|*hdmi*) rank=3 ;;
+            *Headphones*|*bcm2835*)  rank=2 ;;
+            *)                       rank=1 ;;  # USB DAC, HAT, anything external
+        esac
+        if [ "$rank" -lt "$best_rank" ]; then best_rank=$rank; best=$dev; fi
+    done < <(list_outputs)
+    printf '%s' "$best"
+}
+
+# HDMI is locked to 48 kHz. Everything else is happier at 44.1 kHz, the native
+# rate of AirPlay, Bluetooth SBC and Spotify alike.
+rate_for_device() {
+    local dev=$1 desc
+    desc=$(describe_device "$dev" || true)
+    case "$dev $desc" in
+        *vc4hdmi*|*HDMI*|*hdmi*) printf '48000' ;;
+        *)                       printf '44100' ;;
+    esac
+}
+
+card_of() { local c=${1#hw:CARD=}; printf '%s' "${c%%,*}"; }
+
+# A shared dmix so shairport-sync, bluealsa-aplay, gmediarender and librespot
+# can all hold the card at once. ipc_perm 0666 is what makes that work: these
+# daemons run as different users and must attach to the same dmix instance.
+write_asound_dmix() {
+    local dev=$1 rate=$2 card
+    card=$(card_of "$dev")
+    backup_once "$ASOUND"
+    cat >"$ASOUND" <<EOF
+# Written by piaudio $VERSION -- shared software mixer for the audio receivers.
+# Delete this file (or run 'piaudio uninstall') to restore ALSA defaults.
+
+pcm.piaudio_mix {
+    type dmix
+    ipc_key 3141
+    ipc_key_add_uid no
+    ipc_perm 0666
+    slave {
+        pcm "$dev"
+        rate $rate
+        channels 2
+        format S16_LE
+        period_size 1024
+        buffer_size 8192
+    }
+}
+
+pcm.!default {
+    type plug
+    slave.pcm "piaudio_mix"
+}
+
+ctl.!default {
+    type hw
+    card $card
+}
+EOF
+    chmod 0644 "$ASOUND"
+}
+
+write_asound_direct() {
+    local dev=$1 card
+    card=$(card_of "$dev")
+    backup_once "$ASOUND"
+    cat >"$ASOUND" <<EOF
+# Written by piaudio $VERSION -- direct output; dmix was not usable on this
+# card, so only one receiver can play at a time.
+pcm.!default {
+    type plug
+    slave.pcm "$dev"
+}
+
+ctl.!default {
+    type hw
+    card $card
+}
+EOF
+    chmod 0644 "$ASOUND"
+}
+
+# Open the default device briefly to prove the config actually works. /dev/zero
+# has no header, so aplay needs to be told the stream is raw.
+verify_alsa() {
+    aplay -D default -t raw -f S16_LE -r "$1" -c 2 -d 1 -q /dev/zero >/dev/null 2>&1
+}
+
+configure_alsa() {
+    local dev=$1 rate=$2
+
+    write_asound_dmix "$dev" "$rate"
+    if verify_alsa "$rate"; then
+        ok "software mixer active on $dev @ ${rate}Hz"
+        return 0
+    fi
+
+    warn "dmix would not open that card; falling back to direct output"
+    write_asound_direct "$dev"
+    if verify_alsa "$rate"; then
+        ok "direct output active on $dev"
+        warn "only one source can play at a time on this card"
+        return 0
+    fi
+
+    warn "could not open $dev at all; leaving ALSA defaults untouched"
+    restore_backup "$ASOUND" || rm -f "$ASOUND"
+    return 1
+}
+
+# --------------------------------------------------------------- airplay ----
+
+sps_has_airplay2() {
+    have shairport-sync || return 1
+    shairport-sync -V 2>&1 | grep -qi 'airplay[-_]\?2'
+}
+
+# Pick whichever spelling of a configure flag this release actually supports;
+# shairport-sync and nqptp disagree, and both have renamed it over time.
+cfg_flag() {
+    local dir=$1 f; shift
+    for f in "$@"; do
+        if "$dir/configure" --help 2>/dev/null | grep -q -- "$f"; then
+            printf '%s' "$f"; return 0
+        fi
+    done
+    return 1
+}
+
+# Roughly 512 MB of headroom per compiler process, or a Pi Zero runs out.
+build_jobs() {
+    local kb jobs
+    kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 1000000)
+    jobs=$(nproc 2>/dev/null || echo 1)
+    [ "$kb" -lt 1500000 ] && jobs=2
+    [ "$kb" -lt 700000 ]  && jobs=1
+    printf '%s' "$jobs"
+}
+
+build_from_source() {
+    local jobs sysd
+    info "building AirPlay 2 from source -- 10 to 20 minutes, go make a coffee"
+
+    apt_need build-essential git autoconf automake libtool pkg-config \
+        libpopt-dev libconfig-dev libasound2-dev libavahi-client-dev \
+        libssl-dev libsoxr-dev libplist-dev libsodium-dev libavutil-dev \
+        libavcodec-dev libavformat-dev uuid-dev libgcrypt-dev xxd
+
+    BUILD_TMP=$(mktemp -d)
+    jobs=$(build_jobs)
+
+    # nqptp -- the PTP clock daemon that AirPlay 2 needs for multi-room sync.
+    info "compiling nqptp"
+    git clone --depth 1 -q https://github.com/mikebrady/nqptp.git "$BUILD_TMP/nqptp" \
+        || die "could not download nqptp (is the Pi online?)"
+    sysd=$(cfg_flag "$BUILD_TMP/nqptp" --with-systemd-startup --with-systemd || true)
+    (
+        cd "$BUILD_TMP/nqptp"
+        autoreconf -fi >/dev/null 2>&1
+        ./configure ${sysd:+"$sysd"} >/dev/null
+        make -j"$jobs" >/dev/null
+        make install >/dev/null
+    ) || die "nqptp failed to build"
+
+    info "compiling shairport-sync using $jobs job(s)"
+    git clone --depth 1 -q https://github.com/mikebrady/shairport-sync.git "$BUILD_TMP/sps" \
+        || die "could not download shairport-sync"
+    sysd=$(cfg_flag "$BUILD_TMP/sps" --with-systemd --with-systemd-startup || true)
+    (
+        cd "$BUILD_TMP/sps"
+        autoreconf -fi >/dev/null 2>&1
+        ./configure --sysconfdir=/etc --with-alsa --with-soxr --with-avahi \
+            --with-ssl=openssl --with-airplay-2 ${sysd:+"$sysd"} >/dev/null
+        make -j"$jobs" >/dev/null
+        make install >/dev/null
+    ) || die "shairport-sync failed to build"
+
+    rm -rf "$BUILD_TMP"; BUILD_TMP=""
+    hash -r
+    ldconfig || true
+    # The build drops new unit files; systemd has to be told before we look.
+    systemctl daemon-reload
+    ok "AirPlay 2 built and installed"
+}
+
+ensure_sps_user() {
+    getent group shairport-sync >/dev/null || groupadd -r shairport-sync
+    getent passwd shairport-sync >/dev/null || useradd -r -M -g shairport-sync \
+        -s /usr/sbin/nologin -c "shairport-sync" shairport-sync
+    usermod -aG audio shairport-sync || true
+    install -d -o shairport-sync -g shairport-sync /var/lib/shairport-sync
+    return 0
+}
+
+setup_airplay() {
+    if [ "$PIAUDIO_AIRPLAY" = off ]; then
+        info "AirPlay disabled"
+        disable_now shairport-sync.service
+        disable_now nqptp.service
+        return 0
+    fi
+
+    if sps_has_airplay2; then
+        ok "shairport-sync already supports AirPlay 2"
+    else
+        # The distro package may already be new enough; far cheaper to check
+        # than to compile.
+        apt_want shairport-sync >/dev/null 2>&1 || true
+        hash -r
+        if sps_has_airplay2; then
+            ok "the packaged shairport-sync includes AirPlay 2"
+        elif [ "$PIAUDIO_AIRPLAY" = 1 ]; then
+            have shairport-sync || die "shairport-sync is not available via apt; use --airplay 2 to build it"
+            ok "using AirPlay 1 (no compile needed)"
+        else
+            # Drop the apt copy first, or we end up with two binaries and two
+            # competing units.
+            pkg_installed shairport-sync && apt-get remove -y -qq shairport-sync >/dev/null 2>&1
+            hash -r
+            build_from_source
+            sps_has_airplay2 || warn "the build finished but does not report AirPlay 2 support"
+        fi
+    fi
+
+    ensure_sps_user
+
+    backup_once /etc/shairport-sync.conf
+    cat >/etc/shairport-sync.conf <<EOF
+// Written by piaudio $VERSION.
+general = {
+    name = "$PIAUDIO_NAME";
+    ignore_volume_control = "no";
+    volume_range_db = 60;
+};
+
+alsa = {
+    output_device = "default";
+};
+EOF
+    chmod 0644 /etc/shairport-sync.conf
+
+    if unit_exists nqptp.service; then
+        enable_now nqptp.service
+    elif sps_has_airplay2; then
+        warn "nqptp.service is missing; AirPlay 2 cannot work without it"
+    fi
+
+    unit_exists shairport-sync.service || die "shairport-sync installed but has no systemd unit"
+    enable_now shairport-sync.service
+}
+
+# ------------------------------------------------------------- bluetooth ----
+
+# Debian renamed the bluez-alsa daemon from 'bluealsa' to 'bluealsad'; resolve
+# whatever this release actually ships.
+bluealsa_bin() {
+    local c
+    for c in bluealsad bluealsa; do
+        have "$c" && { command -v "$c"; return 0; }
+    done
+    return 1
+}
+bluealsa_unit() {
+    local u
+    for u in bluealsad.service bluealsa.service; do
+        unit_exists "$u" && { printf '%s' "$u"; return 0; }
+    done
+    return 1
+}
+bluealsa_aplay_unit() {
+    local u
+    for u in bluealsad-aplay.service bluealsa-aplay.service; do
+        unit_exists "$u" && { printf '%s' "$u"; return 0; }
+    done
+    return 1
+}
+
+setup_bluetooth() {
+    local bin unit aplay_unit
+
+    if [ "$PIAUDIO_BLUETOOTH" = off ]; then
+        info "Bluetooth disabled"
+        disable_now piaudio-bluetooth.service
+        disable_now piaudio-bt-agent.service
+        disable_now piaudio-bluealsa-aplay.service
+        return 0
+    fi
+
+    apt_need bluez bluez-tools
+    if ! apt_want bluez-alsa-utils; then
+        warn "bluez-alsa-utils is unavailable, so Bluetooth audio will not work"
+        warn "AirPlay and DLNA are unaffected"
+        PIAUDIO_BLUETOOTH=off
+        return 0
+    fi
+
+    bin=$(bluealsa_bin) || {
+        warn "bluez-alsa is installed but its daemon binary is missing"
+        PIAUDIO_BLUETOOTH=off
+        return 0
+    }
+
+    # PipeWire's Bluetooth plugin claims the same BlueZ media endpoint and will
+    # fight bluez-alsa for it. Only present on Desktop images.
+    if pkg_installed libspa-0.2-bluetooth; then
+        warn "libspa-0.2-bluetooth is installed and will compete with bluez-alsa"
+        warn "if Bluetooth audio misbehaves: sudo apt remove libspa-0.2-bluetooth"
+    fi
+
+    # Advertise as a loudspeaker: service class Audio, major Audio/Video, minor
+    # Loudspeaker. Phones then show a speaker icon and offer media audio.
+    backup_once /etc/bluetooth/main.conf
+    ini_set /etc/bluetooth/main.conf General Name "$PIAUDIO_NAME"
+    ini_set /etc/bluetooth/main.conf General Class "0x200414"
+    ini_set /etc/bluetooth/main.conf General DiscoverableTimeout "0"
+    ini_set /etc/bluetooth/main.conf General PairableTimeout "0"
+    ini_set /etc/bluetooth/main.conf General JustWorksRepairing "always"
+    ini_set /etc/bluetooth/main.conf Policy AutoEnable "true"
+
+    # Run the daemon as an A2DP *sink* -- this Pi is the speaker, not the phone.
+    if unit=$(bluealsa_unit); then
+        mkdir -p "/etc/systemd/system/$unit.d"
+        cat >"/etc/systemd/system/$unit.d/piaudio.conf" <<EOF
+# Written by piaudio $VERSION.
+[Service]
+ExecStart=
+ExecStart=$bin -p a2dp-sink
+EOF
+        chmod 0644 "/etc/systemd/system/$unit.d/piaudio.conf"
+    else
+        unit=piaudio-bluealsa.service
+        write_unit /etc/systemd/system/$unit <<EOF
+[Unit]
+Description=BlueALSA A2DP sink (piaudio)
+Requires=bluetooth.service dbus.service
+After=bluetooth.service dbus.service
+
+[Service]
+Type=simple
+ExecStart=$bin -p a2dp-sink
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+
+    # The playback bridge. This is the piece the old setup was missing: A2DP
+    # audio arrives as a capture stream and something has to pump it to the
+    # speaker. bluealsa-aplay with no arguments plays every connected device to
+    # the ALSA "default" device, which is our dmix.
+    if ! aplay_unit=$(bluealsa_aplay_unit); then
+        aplay_unit=piaudio-bluealsa-aplay.service
+        write_unit /etc/systemd/system/$aplay_unit <<EOF
+[Unit]
+Description=BlueALSA playback bridge (piaudio)
+Requires=$unit
+After=$unit
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bluealsa-aplay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+
+    # Adapter bring-up. Generated as its own file so the systemd units never
+    # depend on the management CLI being installed.
+    mkdir -p "$LIBDIR"
+    cat >"$LIBDIR/bt-boot" <<'EOS'
+#!/bin/sh
+# Written by piaudio. Puts the Bluetooth adapter into "speaker" mode at boot.
+[ -f /etc/piaudio.conf ] && . /etc/piaudio.conf
+NAME=${PIAUDIO_NAME:-$(hostname)}
+
+# Wait for bluetoothd to expose an adapter.
+i=0
+while [ $i -lt 30 ]; do
+    bluetoothctl show >/dev/null 2>&1 && break
+    i=$((i + 1)); sleep 1
+done
+
+bluetoothctl power on             >/dev/null 2>&1 || true
+bluetoothctl system-alias "$NAME" >/dev/null 2>&1 || true
+bluetoothctl discoverable on      >/dev/null 2>&1 || true
+bluetoothctl pairable on          >/dev/null 2>&1 || true
+exit 0
+EOS
+    chmod 0755 "$LIBDIR/bt-boot"
+
+    write_unit /etc/systemd/system/piaudio-bluetooth.service <<EOF
+[Unit]
+Description=Make this Pi discoverable as a Bluetooth speaker (piaudio)
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$LIBDIR/bt-boot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # A speaker has no keypad or screen, so pairing has to be accepted for us.
+    write_unit /etc/systemd/system/piaudio-bt-agent.service <<EOF
+[Unit]
+Description=Bluetooth pairing agent (piaudio)
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable bluetooth.service >/dev/null 2>&1 || true
+    systemctl restart bluetooth.service >/dev/null 2>&1 || true
+    enable_now "$unit"
+    enable_now "$aplay_unit"
+    enable_now piaudio-bt-agent.service
+    enable_now piaudio-bluetooth.service
+}
+
+# ------------------------------------------------------------------ dlna ----
+
+setup_dlna() {
+    if [ "$PIAUDIO_DLNA" = off ]; then
+        info "DLNA disabled"
+        disable_now piaudio-dlna.service
+        return 0
+    fi
+
+    if ! apt_want gmediarender; then
+        warn "gmediarender is unavailable in apt; skipping DLNA"
+        PIAUDIO_DLNA=off
+        return 0
+    fi
+    # Decoders. Without these the renderer appears on the network but plays
+    # nothing.
+    apt_want gstreamer1.0-alsa gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+        gstreamer1.0-libav >/dev/null 2>&1 \
+        || warn "some GStreamer codecs are missing; a few formats may not play"
+
+    # A stable UUID stops the renderer reappearing as a brand new device on
+    # every reboot.
+    [ -n "$PIAUDIO_DLNA_UUID" ] || PIAUDIO_DLNA_UUID=$(cat /proc/sys/kernel/random/uuid)
+
+    # The packaged unit, if any, would be a second renderer on the network.
+    unit_exists gmediarender.service && disable_now gmediarender.service
+
+    write_unit /etc/systemd/system/piaudio-dlna.service <<EOF
+[Unit]
+Description=DLNA/UPnP renderer (piaudio)
+After=network-online.target sound.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gmediarender -f "$PIAUDIO_NAME" -u $PIAUDIO_DLNA_UUID \\
+    --gstout-audiosink=alsasink --gstout-audiodevice=default
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    enable_now piaudio-dlna.service
+}
+
+# --------------------------------------------------------------- spotify ----
+
+setup_spotify() {
+    if [ "$PIAUDIO_SPOTIFY" != on ]; then
+        info "Spotify Connect disabled"
+        disable_now raspotify.service
+        return 0
+    fi
+
+    if ! pkg_installed raspotify; then
+        info "adding the Raspotify apt repository"
+        apt_need curl gnupg ca-certificates
+        install -d -m 0755 /etc/apt/keyrings
+        if ! curl -fsSL https://dtcooper.github.io/raspotify/key.asc \
+             | gpg --dearmor -o /etc/apt/keyrings/raspotify.gpg 2>/dev/null; then
+            warn "could not fetch the Raspotify signing key; skipping Spotify Connect"
+            rm -f /etc/apt/keyrings/raspotify.gpg
+            PIAUDIO_SPOTIFY=off
+            return 0
+        fi
+        chmod 0644 /etc/apt/keyrings/raspotify.gpg
+        echo 'deb [signed-by=/etc/apt/keyrings/raspotify.gpg] https://dtcooper.github.io/raspotify raspotify main' \
+            >/etc/apt/sources.list.d/raspotify.list
+        APT_UPDATED=no
+        if ! apt_want raspotify; then
+            warn "Raspotify would not install; skipping Spotify Connect"
+            rm -f /etc/apt/sources.list.d/raspotify.list /etc/apt/keyrings/raspotify.gpg
+            PIAUDIO_SPOTIFY=off
+            return 0
+        fi
+    fi
+
+    mkdir -p /etc/raspotify
+    backup_once /etc/raspotify/conf
+    cat >/etc/raspotify/conf <<EOF
+# Written by piaudio $VERSION.
+LIBRESPOT_NAME="$PIAUDIO_NAME"
+LIBRESPOT_DEVICE_TYPE="speaker"
+LIBRESPOT_BACKEND="alsa"
+LIBRESPOT_DEVICE="default"
+LIBRESPOT_INITIAL_VOLUME="60"
+EOF
+    chmod 0644 /etc/raspotify/conf
+
+    # librespot needs the audio group to reach the ALSA device.
+    getent passwd raspotify >/dev/null && { usermod -aG audio raspotify || true; }
+
+    enable_now raspotify.service
+}
+
+# ------------------------------------------------------------ networking ----
+
+first_wifi_iface() {
+    local d
+    for d in /sys/class/net/wl*; do
+        [ -e "$d" ] && { basename "$d"; return 0; }
+    done
+    return 1
+}
+
+setup_network() {
+    local wlan
+    apt_want avahi-daemon >/dev/null 2>&1 \
+        || warn "avahi-daemon is missing; AirPlay and DLNA discovery may fail"
+    systemctl enable avahi-daemon.service >/dev/null 2>&1 || true
+    systemctl start avahi-daemon.service >/dev/null 2>&1 || true
+    ok "mDNS discovery running"
+
+    # WiFi power saving is the usual cause of AirPlay dropouts and stutter on a
+    # Pi, and it is on by default.
+    if wlan=$(first_wifi_iface); then
+        apt_want iw >/dev/null 2>&1 || true
+        if have iw; then
+            write_unit /etc/systemd/system/piaudio-wifi-powersave.service <<EOF
+[Unit]
+Description=Disable WiFi power saving for glitch-free audio (piaudio)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$(command -v iw) dev $wlan set power_save off
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            enable_now piaudio-wifi-powersave.service
+            ok "WiFi power saving disabled on $wlan"
+        fi
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------- reporting ----
+
+# Every unit this installation is responsible for, as "unit:label".
+active_units() {
+    local u
+    load_conf
+    if [ "${PIAUDIO_AIRPLAY:-off}" != off ]; then
+        unit_exists nqptp.service && echo "nqptp.service:AirPlay 2 timing"
+        echo "shairport-sync.service:AirPlay"
+    fi
+    if [ "${PIAUDIO_BLUETOOTH:-off}" = on ]; then
+        echo "bluetooth.service:Bluetooth stack"
+        u=$(bluealsa_unit)       && echo "$u:Bluetooth audio"
+        u=$(bluealsa_aplay_unit) && echo "$u:Bluetooth playback"
+        echo "piaudio-bluealsa.service:Bluetooth audio"
+        echo "piaudio-bluealsa-aplay.service:Bluetooth playback"
+        echo "piaudio-bt-agent.service:Bluetooth pairing"
+        echo "piaudio-bluetooth.service:Bluetooth discoverable"
+    fi
+    [ "${PIAUDIO_DLNA:-off}" = on ]    && echo "piaudio-dlna.service:DLNA/UPnP"
+    [ "${PIAUDIO_SPOTIFY:-off}" = on ] && echo "raspotify.service:Spotify Connect"
+    echo "avahi-daemon.service:Network discovery"
+    return 0
+}
+
+installed_units() { active_units | sort -u -t: -k1,1; }
+
+print_status() {
+    local unit label state failed=0
+    while IFS=: read -r unit label; do
+        [ -n "$unit" ] || continue
+        unit_exists "$unit" || continue
+        if systemctl is-active --quiet "$unit"; then
+            printf '  %s\xe2\x97\x8f%s %-22s %s%s%s\n' "$G" "$N" "$label" "$DIM" "$unit" "$N"
+        else
+            state=$(systemctl is-active "$unit" 2>/dev/null || true)
+            printf '  %s\xe2\x97\x8f%s %-22s %s%s (%s)%s\n' "$R" "$N" "$label" "$DIM" "$unit" "$state" "$N"
+            failed=$((failed + 1))
+        fi
+    done < <(installed_units)
+    return $failed
+}
+
+# -------------------------------------------------------------- commands ----
+
+choose_output() {
+    local devices=() descs=() dev desc i n auto reply default_idx=1
+
+    while IFS=$'\t' read -r dev desc; do
+        [ -n "$dev" ] || continue
+        devices+=("$dev"); descs+=("$desc")
+    done < <(list_outputs)
+
+    n=${#devices[@]}
+    [ "$n" -eq 0 ] && return 0
+
+    auto=$(autodetect_output)
+    if [ "$n" -eq 1 ] || ! interactive; then
+        printf '%s' "$auto"; return 0
+    fi
+
+    printf '\n  Audio outputs found:\n' >"$TTY"
+    for i in $(seq 0 $((n - 1))); do
+        if [ "${devices[$i]}" = "$auto" ]; then
+            default_idx=$((i + 1))
+            printf '    %s%d)%s %s %s(recommended)%s\n' \
+                "$BOLD" "$((i + 1))" "$N" "${descs[$i]}" "$G" "$N" >"$TTY"
+        else
+            printf '    %s%d)%s %s\n' "$BOLD" "$((i + 1))" "$N" "${descs[$i]}" >"$TTY"
+        fi
+    done
+
+    reply=$(ask "Which output?" "$default_idx")
+    case "$reply" in
+        ''|*[!0-9]*) printf '%s' "$auto" ;;
+        *) if [ "$reply" -ge 1 ] && [ "$reply" -le "$n" ]; then
+               printf '%s' "${devices[$((reply - 1))]}"
+           else
+               printf '%s' "$auto"
+           fi ;;
+    esac
+}
+
+# Strip anything that would break mDNS names or config-file parsing.
+clean_name() { printf '%s' "$1" | tr -d '"\\$`' | cut -c1-40; }
+
+install_self() {
+    local src=""
+    if [ -f "${BASH_SOURCE[0]}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
+        src=${BASH_SOURCE[0]}
+    elif [ -f "$0" ] && [ -r "$0" ]; then
+        src=$0
+    fi
+
+    if [ -n "$src" ]; then
+        install -m 0755 "$src" "$BINPATH"
+        ok "installed $BINPATH"
+    elif have curl && curl -fsSL "$RAW_URL" -o "$BINPATH.tmp" 2>/dev/null; then
+        # Running from `bash -c "$(curl ...)"`, so there is no file to copy.
+        chmod 0755 "$BINPATH.tmp" && mv "$BINPATH.tmp" "$BINPATH"
+        ok "installed $BINPATH"
+    else
+        rm -f "$BINPATH.tmp"
+        warn "could not install the 'piaudio' command (the receivers still work)"
+    fi
+    return 0
+}
+
+cmd_install() {
+    local default_name ip failed=0
+
+    banner
+    need_root install
+    have apt-get || die "this installer needs apt (Raspberry Pi OS or Debian)"
+
+    load_conf
+    init_tty
+    mkdir -p "$BACKUPDIR"
+
+    step "Configuration"
+
+    if [ -n "$OPT_NAME" ]; then
+        PIAUDIO_NAME=$OPT_NAME
+    else
+        default_name=${PIAUDIO_NAME:-$(hostname)}
+        PIAUDIO_NAME=$(ask "Name for this speaker (this is what your phone shows)" "$default_name")
+    fi
+    PIAUDIO_NAME=$(clean_name "$PIAUDIO_NAME")
+    [ -n "$PIAUDIO_NAME" ] || PIAUDIO_NAME=$(hostname)
+    ok "name: $PIAUDIO_NAME"
+
+    apt_need alsa-utils
+
+    if [ -n "$OPT_OUTPUT" ]; then
+        PIAUDIO_DEVICE=$OPT_OUTPUT
+    elif [ -z "$PIAUDIO_DEVICE" ]; then
+        PIAUDIO_DEVICE=$(choose_output)
+    fi
+    if [ -n "$PIAUDIO_DEVICE" ]; then
+        PIAUDIO_RATE=$(rate_for_device "$PIAUDIO_DEVICE")
+        ok "output: $(describe_device "$PIAUDIO_DEVICE") ${DIM}[$PIAUDIO_DEVICE]${N}"
+    else
+        warn "no audio output detected; connect a speaker then run 'sudo piaudio output'"
+    fi
+
+    [ -n "$OPT_AIRPLAY" ]   && PIAUDIO_AIRPLAY=$OPT_AIRPLAY
+    [ -n "$OPT_BLUETOOTH" ] && PIAUDIO_BLUETOOTH=$OPT_BLUETOOTH
+    [ -n "$OPT_DLNA" ]      && PIAUDIO_DLNA=$OPT_DLNA
+
+    if [ -n "$OPT_SPOTIFY" ]; then
+        PIAUDIO_SPOTIFY=$OPT_SPOTIFY
+    elif [ "$PIAUDIO_SPOTIFY" != on ] && interactive; then
+        say ""
+        info "${DIM}Spotify Connect lets the Spotify app on any phone play here"
+        info "directly, with no pairing. It installs Raspotify, which adds a"
+        info "third-party apt repository (dtcooper.github.io) to this Pi.${N}"
+        confirm "Enable Spotify Connect?" no && PIAUDIO_SPOTIFY=on
+    fi
+
+    if [ "$PIAUDIO_AIRPLAY" = 2 ] && ! sps_has_airplay2 && interactive; then
+        say ""
+        info "${DIM}AirPlay 2 adds multi-room grouping and proper volume sync, but"
+        info "has to be compiled here (10-20 min). AirPlay 1 installs in seconds"
+        info "and still works from an iPhone for a single speaker.${N}"
+        confirm "Build AirPlay 2 from source?" yes || PIAUDIO_AIRPLAY=1
+    fi
+
+    save_conf
+
+    step "System packages"
+    if [ "$SKIP_UPGRADE" = no ]; then
+        info "upgrading packages (skip this next time with --no-upgrade)"
+        apt-get upgrade "${APT_OPTS[@]}" -qq >/dev/null 2>&1 \
+            || warn "apt upgrade reported problems; continuing anyway"
+    fi
+    apt_need ca-certificates
+    ok "base system ready"
+
+    step "Audio output"
+    if [ -n "$PIAUDIO_DEVICE" ]; then
+        configure_alsa "$PIAUDIO_DEVICE" "$PIAUDIO_RATE" || true
+    else
+        warn "skipped: no output device"
+    fi
+
+    step "Network discovery"
+    setup_network
+
+    step "AirPlay"
+    setup_airplay
+
+    step "Bluetooth"
+    setup_bluetooth
+
+    step "DLNA / UPnP"
+    setup_dlna
+
+    step "Spotify Connect"
+    setup_spotify
+
+    step "Management command"
+    install_self
+
+    save_conf
+    systemctl daemon-reload
+
+    step "Checking services"
+    sleep 3
+    print_status || failed=$?
+
+    ip=$(local_ip)
+    say ""
+    printf '%s%s  %s is ready.%s\n\n' "$BOLD" "$G" "$PIAUDIO_NAME" "$N"
+    [ "${PIAUDIO_AIRPLAY:-off}" != off ] && say "  iPhone / iPad   Control Center -> AirPlay -> $PIAUDIO_NAME"
+    [ "${PIAUDIO_BLUETOOTH:-off}" = on ] && say "  Android / any   Bluetooth settings -> pair with $PIAUDIO_NAME"
+    [ "${PIAUDIO_SPOTIFY:-off}" = on ]   && say "  Spotify         Now Playing -> Devices -> $PIAUDIO_NAME"
+    [ "${PIAUDIO_DLNA:-off}" = on ]      && say "  Android apps    BubbleUPnP / VLC -> renderer -> $PIAUDIO_NAME"
+    [ -n "$ip" ] && { say ""; say "  ${DIM}This Pi is at $ip${N}"; }
+    say ""
+    say "  ${DIM}piaudio status${N}   what is running, and who is connected"
+    say "  ${DIM}piaudio test${N}     play a test tone"
+    say "  ${DIM}piaudio rename${N}   change the name"
+    say ""
+
+    if [ "$failed" -gt 0 ]; then
+        warn "$failed service(s) are not running yet"
+        info "a reboot clears up most of these:  ${BOLD}sudo reboot${N}"
+        info "or look at the logs:  ${BOLD}piaudio logs${N}"
+    else
+        info "Reboot recommended but not required:  ${BOLD}sudo reboot${N}"
+    fi
+    say ""
+}
+
+cmd_status() {
+    local ip d connected
+    load_conf
+    ip=$(local_ip)
+
+    say ""
+    printf '  %s%s%s' "$BOLD" "${PIAUDIO_NAME:-not configured}" "$N"
+    [ -n "$ip" ] && printf ' %s(%s)%s' "$DIM" "$ip" "$N"
+    printf '\n'
+    if [ -n "${PIAUDIO_DEVICE:-}" ]; then
+        d=$(describe_device "$PIAUDIO_DEVICE")
+        say "  ${DIM}output: ${d:-$PIAUDIO_DEVICE} @ ${PIAUDIO_RATE}Hz${N}"
+    fi
+    say ""
+    print_status || true
+
+    if [ "${PIAUDIO_BLUETOOTH:-off}" = on ] && have bluetoothctl; then
+        connected=$(bluetoothctl devices Connected 2>/dev/null | sed 's/^Device [0-9A-Fa-f:]* //' || true)
+        if [ -n "$connected" ]; then
+            say ""
+            info "Bluetooth connected:"
+            printf '%s\n' "$connected" | while IFS= read -r d; do info "  $d"; done
+        fi
+    fi
+    say ""
+}
+
+cmd_logs() {
+    local unit=${1:-} u args=()
+    load_conf
+    if [ -z "$unit" ]; then
+        while IFS=: read -r u _; do
+            [ -n "$u" ] && unit_exists "$u" && args+=(-u "$u")
+        done < <(installed_units)
+        [ ${#args[@]} -eq 0 ] && die "nothing is installed yet"
+        exec journalctl "${args[@]}" -n 100 -f
+    fi
+    case "$unit" in *.service) ;; *) unit="$unit.service" ;; esac
+    exec journalctl -u "$unit" -n 200 -f
+}
+
+cmd_rename() {
+    local new=${1:-}
+    need_root rename
+    load_conf
+    init_tty
+
+    [ -n "$new" ] || new=$(ask "New name" "${PIAUDIO_NAME:-$(hostname)}")
+    new=$(clean_name "$new")
+    [ -n "$new" ] || die "the name cannot be empty"
+
+    PIAUDIO_NAME=$new
+    save_conf
+
+    [ -f /etc/shairport-sync.conf ] && \
+        sed -i "s/^\( *name *= *\).*/\1\"$new\";/" /etc/shairport-sync.conf
+    [ -f /etc/bluetooth/main.conf ] && ini_set /etc/bluetooth/main.conf General Name "$new"
+    [ -f /etc/raspotify/conf ] && \
+        sed -i "s/^LIBRESPOT_NAME=.*/LIBRESPOT_NAME=\"$new\"/" /etc/raspotify/conf
+    if [ -f /etc/systemd/system/piaudio-dlna.service ]; then
+        sed -i "s/-f \"[^\"]*\"/-f \"$new\"/" /etc/systemd/system/piaudio-dlna.service
+    fi
+    systemctl daemon-reload
+
+    cmd_restart
+    ok "renamed to $new"
+}
+
+cmd_output() {
+    local dev=${1:-}
+    need_root output
+    load_conf
+    init_tty
+
+    [ -n "$dev" ] || dev=$(choose_output)
+    [ -n "$dev" ] || die "no audio output available"
+
+    PIAUDIO_DEVICE=$dev
+    PIAUDIO_RATE=$(rate_for_device "$dev")
+    save_conf
+    configure_alsa "$dev" "$PIAUDIO_RATE" || die "could not configure $dev"
+    cmd_restart
+}
+
+cmd_test() {
+    load_conf
+    have speaker-test || die "alsa-utils is not installed"
+    info "playing a 440Hz tone on ${PIAUDIO_DEVICE:-default}"
+    if speaker-test -D default -t sine -f 440 -l 3 -c 2 >/dev/null 2>&1; then
+        ok "done -- if you heard a tone, output is working"
+    else
+        err "playback failed; check 'piaudio status' and the speaker connection"
+        return 1
+    fi
+}
+
+cmd_restart() {
+    local unit
+    need_root restart
+    load_conf
+    while IFS=: read -r unit _; do
+        [ -n "$unit" ] || continue
+        unit_exists "$unit" || continue
+        systemctl restart "$unit" >/dev/null 2>&1 || warn "$unit failed to restart"
+    done < <(installed_units)
+    ok "services restarted"
+}
+
+cmd_uninstall() {
+    local unit
+    banner
+    need_root uninstall
+    load_conf
+    init_tty
+
+    confirm "Remove the piaudio receiver from this Pi?" no || { info "cancelled"; exit 0; }
+
+    info "stopping services"
+    for unit in shairport-sync.service nqptp.service piaudio-dlna.service \
+                raspotify.service piaudio-bluetooth.service piaudio-bt-agent.service \
+                piaudio-bluealsa.service piaudio-bluealsa-aplay.service \
+                piaudio-wifi-powersave.service gmediarender.service; do
+        disable_now "$unit"
+    done
+    unit=$(bluealsa_unit)       && disable_now "$unit"
+    unit=$(bluealsa_aplay_unit) && disable_now "$unit"
+
+    info "restoring configuration"
+    rm -f /etc/systemd/system/piaudio-*.service
+    rm -rf /etc/systemd/system/bluealsa.service.d /etc/systemd/system/bluealsad.service.d
+    rm -rf "$LIBDIR"
+    restore_backup /etc/bluetooth/main.conf   || true
+    restore_backup /etc/shairport-sync.conf   || rm -f /etc/shairport-sync.conf
+    restore_backup /etc/raspotify/conf        || true
+    restore_backup "$ASOUND"                  || rm -f "$ASOUND"
+    rm -f "$CONF"
+    systemctl daemon-reload
+
+    if confirm "Also remove the packages (shairport-sync, bluez-alsa, gmediarender, raspotify)?" no; then
+        apt-get remove -y -qq shairport-sync bluez-alsa-utils gmediarender raspotify >/dev/null 2>&1 || true
+        rm -f /etc/apt/sources.list.d/raspotify.list /etc/apt/keyrings/raspotify.gpg
+        # Anything compiled from source lives under /usr/local.
+        rm -f /usr/local/bin/shairport-sync /usr/local/bin/nqptp
+        rm -f /lib/systemd/system/nqptp.service /lib/systemd/system/shairport-sync.service
+        rm -f /usr/local/lib/systemd/system/nqptp.service \
+              /usr/local/lib/systemd/system/shairport-sync.service
+        systemctl daemon-reload
+        ok "packages removed"
+    fi
+
+    rm -f "$BINPATH"
+    rmdir "$BACKUPDIR" 2>/dev/null || true
+    say ""
+    ok "piaudio removed. Reboot to clear any lingering state."
+    say ""
+}
+
+cmd_update() {
+    local tmp
+    need_root update
+    have curl || die "curl is required in order to update"
+    tmp=$(mktemp)
+    curl -fsSL "$RAW_URL" -o "$tmp" || { rm -f "$tmp"; die "could not download the latest version"; }
+    bash -n "$tmp" || { rm -f "$tmp"; die "the downloaded file is not valid; nothing changed"; }
+    install -m 0755 "$tmp" "$BINPATH"
+    rm -f "$tmp"
+    ok "updated"
+    info "run 'sudo piaudio install' to apply it"
+}
+
+usage() {
+    cat <<EOF
+${BOLD}piaudio $VERSION${N} -- wireless speaker for iPhone and Android
+
+${BOLD}USAGE${N}
+  sudo piaudio [command] [options]
+
+${BOLD}COMMANDS${N}
+  install         Install or reconfigure the receiver (default)
+  status          Show what is running and who is connected
+  logs [service]  Follow logs for everything, or one service
+  rename [name]   Change the name phones see
+  output [device] Choose the audio output
+  test            Play a test tone
+  restart         Restart all receiver services
+  update          Fetch the newest piaudio
+  uninstall       Remove everything
+
+${BOLD}INSTALL OPTIONS${N}
+  -n, --name NAME         Speaker name          (default: hostname)
+  -o, --output DEVICE     ALSA device           (default: auto-detect)
+      --airplay 2|1|off   AirPlay mode          (default: 2)
+      --bluetooth on|off  Bluetooth A2DP        (default: on)
+      --dlna on|off       DLNA/UPnP renderer    (default: on)
+      --spotify on|off    Spotify Connect       (default: off)
+      --no-upgrade        Skip 'apt upgrade'    (much faster)
+  -y, --yes               Never prompt; take the defaults
+  -h, --help              This text
+
+${BOLD}EXAMPLES${N}
+  sudo piaudio                                 interactive install
+  sudo piaudio -y -n Kitchen --no-upgrade      unattended, builds AirPlay 2
+  sudo piaudio -y -n Patio --airplay 1         fast install, no compiling
+  sudo piaudio rename "Living Room"
+EOF
+}
+
+# -------------------------------------------------------------- dispatch ----
+
+OPT_NAME=""; OPT_OUTPUT=""; OPT_AIRPLAY=""; OPT_BLUETOOTH=""
+OPT_DLNA=""; OPT_SPOTIFY=""; ASSUME_YES=no; SKIP_UPGRADE=no
+
+main() {
+    local cmd=install args=()
+
+    if [ $# -gt 0 ]; then
+        case "$1" in
+            install|status|logs|rename|output|test|restart|uninstall|update)
+                cmd=$1; shift ;;
+            help|-h|--help) usage; exit 0 ;;
+            --version) printf 'piaudio %s\n' "$VERSION"; exit 0 ;;
+        esac
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--name)      OPT_NAME=${2:-};      shift 2 ;;
+            -o|--output)    OPT_OUTPUT=${2:-};    shift 2 ;;
+            --airplay)      OPT_AIRPLAY=${2:-};   shift 2 ;;
+            --bluetooth)    OPT_BLUETOOTH=${2:-}; shift 2 ;;
+            --dlna)         OPT_DLNA=${2:-};      shift 2 ;;
+            --spotify)      OPT_SPOTIFY=${2:-};   shift 2 ;;
+            --no-upgrade)   SKIP_UPGRADE=yes;     shift ;;
+            -y|--yes)       ASSUME_YES=yes;       shift ;;
+            -h|--help)      usage; exit 0 ;;
+            -*)             die "unknown option: $1 (try --help)" ;;
+            *)              args+=("$1");         shift ;;
+        esac
+    done
+
+    case "$OPT_AIRPLAY"   in ""|2|1|off) ;; *) die "--airplay must be 2, 1 or off" ;; esac
+    case "$OPT_BLUETOOTH" in ""|on|off)  ;; *) die "--bluetooth must be on or off" ;; esac
+    case "$OPT_DLNA"      in ""|on|off)  ;; *) die "--dlna must be on or off" ;; esac
+    case "$OPT_SPOTIFY"   in ""|on|off)  ;; *) die "--spotify must be on or off" ;; esac
+
+    case "$cmd" in
+        install)   cmd_install ;;
+        status)    cmd_status ;;
+        logs)      cmd_logs "${args[0]:-}" ;;
+        rename)    cmd_rename "${args[0]:-}" ;;
+        output)    cmd_output "${args[0]:-}" ;;
+        test)      cmd_test ;;
+        restart)   cmd_restart ;;
+        update)    cmd_update ;;
+        uninstall) cmd_uninstall ;;
+    esac
+}
+
+main "$@"
